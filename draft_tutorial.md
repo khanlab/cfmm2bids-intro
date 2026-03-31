@@ -1,72 +1,46 @@
-# SPIMquant demo 
+# cfmm2bids overview
 
-- overview of spimquant
-   https://github.com/khanlab/SPIMquant
-   https://spimquant.readthedocs.io/en/latest/
+- overview of cfmm2bids
+   https://github.com/khanlab/cfmm2bids
 
-- spimprep
-  - pre-requisite pipeline to get bids data with ome zarr
-  - can take stitched imaris data, tif files, etc.. 
+- what is cfmm2bids?
+  - snakemake workflow for reproducible, automated DICOM → BIDS conversion
+  - driven by a single YAML config file per study
+  - covers: query, filter, download, convert, fix, (optional) gradcorrect
 
-- registration pipeline
+- workflow stages
+  1. query — search CFMM DICOM server for matching studies → studies.tsv
+     - uses cfmm2tar to query by study_description, study_date, patient_name
+     - query caching: skip if parameters unchanged
+  2. filter — include/exclude rules, session remapping by date
+     - pandas query syntax
+     - remap_sessions_by_date: auto-label ses-06m, ses-12m, etc.
+  3. download — download DICOM tar files via cfmm2tar
+     - centralized download cache (by StudyInstanceUID)
+     - --skip-derived to skip scanner-reconstructed images
+  4. convert — heudiconv DICOM → BIDS
+     - study-specific heuristic (trident_15T.py, ki3_15T.py, etc.)
+     - QC reports: series.svg, unmapped.svg per subject/session
+     - aggregate_report.html
+  5. fix — post-conversion patches
+     - update_json: add metadata fields (e.g. Units: rad for phase images)
+     - fix_orientation_quadruped: reorient for mouse/rat data
+     - split_multiecho_nifti: split multi-echo data
+     - remove: delete unwanted files
 
-  - what it does
-     - show dag with --no-segmentation, --no-vessels
-     - also with --register-to-mri
-  - what it produces
-     - final concatenated transforms
-     - template segmentations in SPIM space
-     - template segmentations in MRI space
-     - reports
-  
+- trident study examples (config/trident/)
+  - vaccine.yml: premap raw patient names, constant session label, session remapping
+  - ki3.yml: custom session labels (11m, 14m), split multi-echo, ki3_15T heuristic
+  - lecanemab_early.yml: multiple search specs, subject ID map, session remapping
+  - lecanemab_late.yml: null mapping to exclude specific subjects
+  - mouse_app_mapt_apoe.yml: format string for subject IDs (AA{value})
 
-- quantification pipeline
+- running the workflow
+  - pixi run snakemake --configfile config/trident/vaccine.yml --cores all
+  - dry-run, head=1 for testing
+  - --executor slurm for cluster
+  - force_requery=true when new scans acquired
 
-  - segmentation
-    - n4 bias field
-    - multiotsu  vs  manual threshold
-    - better methods in the works (e.g. self-supervised segmentation)
-
-  - field-fraction estimation
-    - downsample-by-averaging of binary seg at fg=100
-     -  _fieldfrac.nii
-    - also with transformation to template 
-     - space-{template}_fieldfrac.nii
-    - also tabular aggregated to ROIs
-     - seg-{roi}_segstats.tsv
-    - and heatmaps:
-     - seg-{roi}_fieldfrac.nii
-   
-
-   - instance-based metrics
-     - instance segmentation done by connected components in each chunk
-       - chunks with an overlap to ensure objects at boundary are captured
-       - instances with centroids inside the chunk are retained
-     - features:
-       - count: number of instances in a region/voxel
-       - density: instances per regional volume 
-       - nvoxels: size of instances
-       - ...
-
-  - vessel segmentation
-     - vesselfm for CD31
-     - signed distance transform for relating plaques/cells with vessels
-     - better methods in the works (e.g. vessel graph)
-
-
-
-
-- running the pipeline
-  - key cli options
-    - registraiton-level
-    - segmentation-level
-    - masking options
-    - template 
-    - atlas
-
-
-
-- demo
-  - walkthrough of various outputs at subject level
-  - walkthrough of an example analysis done on a batch
-  - 
+- outputs
+  - bids/ — final validated BIDS dataset
+  - qc/aggregate_report.html — per-session series tables, fix provenance

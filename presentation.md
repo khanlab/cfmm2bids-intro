@@ -2,8 +2,8 @@
 marp: true
 theme: default
 paginate: true
-header: "SPIMquant — Intro Tutorial & Demo"
-footer: "Khan Lab | https://github.com/khanlab/SPIMquant"
+header: "cfmm2bids — Reproducible & Automated BIDS Conversion"
+footer: "Khan Lab | https://github.com/khanlab/cfmm2bids"
 style: |
   section {
     font-size: 1.4rem;
@@ -13,7 +13,7 @@ style: |
     justify-content: center;
   }
   code {
-    font-size: 0.9rem;
+    font-size: 0.85rem;
   }
   h1 { color: #2c5f8a; }
   h2 { color: #3a7abf; }
@@ -22,370 +22,439 @@ style: |
 
 <!-- _class: title -->
 
-# SPIMquant
+# cfmm2bids
 
-### Automated Quantitative Analysis of Lightsheet Microscopy Data
+### Reproducible & Automated BIDS Conversion for CFMM MRI Studies
 
 **Khan Lab**
-https://github.com/khanlab/SPIMquant
-https://spimquant.readthedocs.io
+https://github.com/khanlab/cfmm2bids
 
 ---
 
-## What is SPIM?
+## The Problem
 
-**Selective Plane Illumination Microscopy** (Lightsheet)
+MRI data at CFMM is stored in DICOM format on the PACS server.
 
-- Whole-brain fluorescence imaging at cellular resolution
-- Common applications:
-  - Beta-amyloid / alpha-synuclein plaque mapping (AD/PD models)
-  - Microglia density (Iba1)
-  - Cholinergic neurons (ChAT)
-  - Vasculature (CD31, Lectin)
-- Results in **large, multi-resolution OME-Zarr datasets**
+**Before analysis, we need to:**
+1. Find which DICOM studies belong to our project
+2. Download the relevant data
+3. Convert DICOMs → NIfTI in [BIDS format](https://bids-specification.readthedocs.io)
+4. Apply post-conversion fixes (metadata, orientation)
+5. Validate the resulting BIDS dataset
 
-### Challenge
+> Doing this manually is time-consuming, error-prone, and hard to reproduce.
 
-> How do we go from a terabyte-scale whole-brain image to **quantitative, region-specific statistics**?
+### Solution: **cfmm2bids**
 
----
-
-## SPIMquant Overview
-
-A **Snakemake / BIDS App** for automated quantification of lightsheet brain microscopy data.
-
-**Key capabilities:**
-- Deformable registration to a brain atlas template
-- Atlas-based segmentation and quantification
-- Multi-stain support (plaques, cells, vessels)
-- Participant-level **and** group-level statistics
-
-**Links:**
-- 🔗 GitHub: https://github.com/khanlab/SPIMquant
-- 📖 Docs: https://spimquant.readthedocs.io
-- 🧰 Requires: Linux 64-bit, Pixi, ≥32 GB RAM
+A **Snakemake workflow** that automates the entire pipeline — from querying the DICOM server to a validated BIDS dataset — driven by a single YAML config file.
 
 ---
 
-## Pipeline Overview
+## Workflow Overview
 
 ```
-Raw SPIM data  →  SPIMprep  →  BIDS dataset (OME-Zarr)
-                                      │
-                              SPIMquant (participant)
-                                      │
-               ┌──────────────────────┼──────────────────────┐
-               │                      │                       │
-         Registration           Segmentation           Vessel seg
-         (template)             (plaques/cells)         (CD31/Lectin)
-               │                      │                       │
-               └──────────────────────┴──────────────────────┘
-                                      │
-                               Quantification
-                          (field fraction, counts,
-                           density, region stats)
-                                      │
-                        SPIMquant (group statistics)
+ config/trident/vaccine.yml
+           │
+           ▼
+ ┌─────────────────┐
+ │  1. Query       │  Search CFMM DICOM server → studies.tsv
+ └────────┬────────┘
+          ▼
+ ┌─────────────────┐
+ │  2. Filter      │  Include/exclude rules → studies_filtered.tsv
+ └────────┬────────┘
+          ▼
+ ┌─────────────────┐
+ │  3. Download    │  cfmm2tar → dicoms/sub-*/ses-*/
+ └────────┬────────┘
+          ▼
+ ┌─────────────────┐
+ │  4. Convert     │  heudiconv → bids-staging/ + QC reports
+ └────────┬────────┘
+          ▼
+ ┌─────────────────┐
+ │  5. Fix         │  Post-conversion fixes → bids/
+ └────────┬────────┘
+          ▼
+      bids/  ✓ validated BIDS dataset
 ```
 
 ---
 
-## SPIMprep — Prerequisite
+## Stage 1 — Query
 
-**SPIMprep** converts raw acquisition data into a BIDS-compatible dataset with OME-Zarr images.
+Searches the CFMM DICOM server for matching studies.
 
-**Accepts:**
-- Stitched Imaris (`.ims`) files
-- Multi-tile TIFF stacks
-- Other common lightsheet formats
+**Configured via `search_specs` in the YAML config.**
 
-**Produces:**
-- BIDS dataset with `sub-*/micr/*_SPIM.ome.zarr`
-- Multi-resolution image pyramid (levels 0–5+)
-- Metadata in `dataset_description.json`, `participants.tsv`
+Each specification defines:
+- A DICOM query (study description, date range, patient name pattern)
+- Metadata mappings to extract `subject` and `session` IDs
 
-> SPIMprep ensures SPIMquant always receives well-structured, validated input data.
+Output: `results/<study>/0_query/studies.tsv`
 
-🔗 https://github.com/khanlab/spimprep
+> Queries are **cached** by hash — re-running skips the query if parameters haven't changed.
+> Use `--config force_requery=true` when new scans have been acquired.
+
+Multiple `search_specs` can be combined into one BIDS dataset — useful for studies that span different scanner protocols or date ranges.
 
 ---
 
-## Registration Pipeline
+## Stage 1 — Query: Trident Example (vaccine study)
 
-Aligns each SPIM image to a common brain atlas template.
+```yaml
+search_specs:
+  - dicom_query:
+      study_description: "*VaccIBV"
+      study_date: 20250405-          # All scans from April 5, 2025 onward
+    metadata_mappings:
+      subject:
+        source: PatientName
+        pattern: '(AS[a-z0-9A-Z]+)$' # Extract subject ID (e.g. AS177M2)
+        sanitize: true               # Strip non-alphanumeric characters
+      session:
+        source: StudyDate            # Use scan date as session ID (remapped later)
 
-### What it does
-
-1. **Import**: Convert OME-Zarr → NIfTI at a downsampled level
-2. **Masking**: Generate brain mask with Gaussian Mixture Model (GMM)
-3. **Rigid registration**: Coarse alignment at downsampled resolution (default: level 5)
-4. **Deformable registration**: High-quality nonlinear alignment (greedy / ANTs)
-5. **QC report**: HTML visual inspection report
-
-```bash
-# Registration-only dry run (no segmentation, no vessels)
-pixi run spimquant /bids /out participant \
-  --no-segmentation --no-vessels -np
+  - dicom_query:
+      study_description: "*VaccIBV"
+      study_date: 20250401-20250404  # Earlier scans started at session 12m
+    metadata_mappings:
+      subject:
+        source: PatientName
+        pattern: '(AS[a-z0-9A-Z]+)$'
+        sanitize: true
+        premap:                      # Rename raw PatientName values
+          177M2: AS177M2
+      session:
+        constant: '12m'              # All these scans are the 12-month timepoint
 ```
 
 ---
 
-## Registration Pipeline — Outputs
+## Stage 2 — Filter
 
-| File | Description |
-|------|-------------|
-| `xfm/*_from-SPIM_to-{template}_*.mat` | Forward transform (SPIM → template) |
-| `xfm/*_regqc.html` | HTML registration QC report |
-| `xfm/*_regqc.png` | QC snapshot image |
-| `micr/*_space-{template}_SPIM.nii.gz` | SPIM in template space |
-| `parc/*_from-{template}_dseg.nii.gz` | Atlas parcellation in native SPIM space |
+Post-filters the queried studies before download.
 
-### Supported Templates
+**Configured via `study_filter_specs`.**
 
-| Template | Species | Notes |
-|----------|---------|-------|
-| ABAv3 | Mouse | Allen Brain Atlas v3 (default) |
-| DSURQE | Mouse | Dorr atlas, 40 µm MRI |
-| gubra | Mouse | Gubra atlas |
-| MBMv3 | Marmoset | Primate studies |
-| turone | Mouse | Turone atlas |
+- `include` / `exclude`: pandas query syntax
+- `remap_sessions_by_date`: automatically rename sessions by time since first scan (or age at scan)
 
----
-
-## Registration Pipeline — MRI Co-registration
-
-Optional: register a corresponding MRI to SPIM space (and vice versa).
-
-```bash
-pixi run spimquant /bids /out participant \
-  --register-to-mri \
-  --template-mri DSURQE
+**Trident vaccine example:**
+```yaml
+study_filter_specs:
+  include:
+  exclude:
+  remap_sessions_by_date:
+    enable: true
+    units: 'months'
+    round_step: 3
+    time_to_label:
+      0: '06m'
+      3: '09m'
+      6: '12m'
 ```
 
-**Output:**
-- `anat/*_space-{template}_via-SPIM_desc-preproc_T2w.nii.gz`
-  MRI registered to template space via the SPIM → template transform
-
-> Enables direct comparison of structural MRI features with microscopy signals.
+> Study dates become meaningful session labels: `ses-06m`, `ses-09m`, `ses-12m`
 
 ---
 
-## Quantification Pipeline — Segmentation
+## Stage 2 — Filter: Subject Mapping Examples
 
-Segment the signal of interest in the registered SPIM image.
+### Excluding subjects with null mapping (lecanemab_late study)
+```yaml
+subject:
+  source: PatientName
+  pattern: '_(AS[0-9a-zA-Z]+[MF][0-9])$'
+  map:
+    'AS160M1': null   # Map to null → excluded from dataset
+    'AS160M2': null
+```
 
-### Intensity Correction
+### Renaming subject IDs (lecanemab_early study)
+```yaml
+subject:
+  source: PatientName
+  pattern: '4_([0-9]+-[0-9][MF][0-9])$'
+  map:
+    '64-5F2': AS303F2   # Rename to canonical subject ID
+    '71-2M1': AS305M1
+```
 
-- **N4 bias field correction** (default) or Gaussian-based correction
-- Corrects spatial intensity non-uniformity before thresholding
+### Reformatting extracted IDs (mouse_app_mapt_apoe study)
+```yaml
+subject:
+  source: PatientName
+  pattern: 'APOE\*?[34]-([0-9\-]+[MF]#[0-9]+)$'
+  sanitize: true
+  format: "AA{value}"  # Prepend "AA" → e.g. AA12M1
+```
 
-### Segmentation Methods
+---
 
-| Method | Description |
+## Stage 3 — Download
+
+Downloads DICOM data from CFMM using `cfmm2tar`.
+
+**Key features:**
+- **Centralized download cache** indexed by `StudyInstanceUID`
+  - Avoids re-downloading the same study when subject/session mappings change
+  - Subject/session directories contain symlinks to cached tar files
+- `--skip-derived` option (used in all Trident studies) skips scanner-derived images
+- `merge_duplicate_studies: true` merges multiple same-day scans into one session
+
+**Trident configuration (shared across studies):**
+```yaml
+cfmm2tar_download_options: '--skip-derived'
+merge_duplicate_studies: false
+download_cache: "/nfs/trident3/mri/cfmm2bids/results/download_cache"
+```
+
+Output:
+```
+results/download_cache/{StudyInstanceUID}/   ← cached tar archives
+dicoms/sub-*/ses-*/                          ← symlinks to cache
+```
+
+---
+
+## Stage 4 — Convert
+
+Converts DICOMs to BIDS using **heudiconv** with a study-specific heuristic.
+
+**The heuristic maps DICOM series → BIDS filenames.**
+
+| Heuristic | Used by |
+|-----------|---------|
+| `heuristics/trident_15T.py` | vaccine, lecanemab_early, lecanemab_late |
+| `heuristics/ki3_15T.py` | ki3 |
+| `heuristics/Schmitz^MouseAD_heuristic.py` | mouse_app_mapt_apoe |
+| `heuristics/cfmm_base.py` | General CFMM studies |
+
+**Trident convert config:**
+```yaml
+heudiconv_options: '--minmeta --use-enhanced-dicom --no-sanitize-jsons'
+heuristic: heuristics/trident_15T.py
+dcmconfig_json: resources/dcm2niix_config.json
+```
+
+**Outputs per subject/session:**
+- `bids-staging/sub-*/ses-*/` — BIDS-formatted NIfTI + JSON files
+- `qc/sub-*/ses-*/series.svg` — Series list QC report
+- `qc/sub-*/ses-*/unmapped.svg` — Unmapped series summary
+
+---
+
+## Stage 4 — QC Reports
+
+Two QC reports are generated automatically for each subject/session.
+
+### Series list (`series.svg`)
+Shows every DICOM series with:
+- Series description & protocol name
+- Image dimensions, TR, TE
+- Mapped BIDS filename (or "NOT MAPPED")
+
+### Unmapped summary (`unmapped.svg`)
+Lists series that were **not** mapped to BIDS — useful for spotting missing heuristic rules or unexpected acquisitions.
+
+### Aggregate HTML report
+After the fix stage, a single report consolidates all subjects:
+```
+results/4_fix/qc/aggregate_report.html
+```
+Includes validation results, fix provenance, and per-session series tables.
+
+---
+
+## Stage 5 — Fix
+
+Applies post-conversion patches to make the dataset BIDS-compliant.
+
+**Configured via `post_convert_fixes` — a list of named fix actions.**
+
+### Fix actions available
+
+| Action | Description |
 |--------|-------------|
-| `otsu+k3i2` | Multi-Otsu thresholding (3 classes, index 2) — **default** |
-| `threshold` | Manual intensity threshold |
+| `remove` | Delete files matching a glob pattern |
+| `update_json` | Add/update fields in JSON sidecar files |
+| `fix_orientation` | Reorient NIfTI to canonical RAS+ |
+| `fix_orientation_quadruped` | Reorient for quadruped (mouse) data |
+| `split_multiecho_nifti` | Split multi-echo NIfTI into separate files |
+| `remove_duplicate_niftis` | Remove duplicate NIfTIs (keeps first alphabetically) |
+| `intended_for` | Set `IntendedFor` in fieldmap JSON files |
 
-```bash
-pixi run spimquant /bids /out participant \
-  --seg-method otsu+k3i2 \
-  --correction-method n4
+Output: `bids/` — the final, validated BIDS dataset
+
+---
+
+## Stage 5 — Fix: Trident Examples
+
+### Common fixes used across all Trident studies
+
+```yaml
+post_convert_fixes:
+  # Add Units field to phase images (required for BIDS compliance)
+  - name: phase_units
+    pattern: "*/*_part-phase_*.json"
+    action: update_json
+    updates:
+      Units: rad
+
+  # Reorient all NIfTI files for quadruped (mouse/rat) anatomy
+  - name: reset_orientation
+    pattern: "*/*.nii.gz"
+    action: fix_orientation_quadruped
 ```
 
-> Better methods in active development (e.g., self-supervised deep learning segmentation)
+### KI3-specific fix (split multi-echo data)
+
+```yaml
+  # Split multi-echo T2* images into individual echo files
+  - name: split_multiecho_t2starw
+    pattern: "anat/*T2starw.nii.gz"
+    action: split_multiecho_nifti
+
+  # Remove auto-generated scans.tsv (not needed)
+  - name: remove_scans_tsv
+    pattern: "*scans.tsv"
+    action: remove
+```
 
 ---
 
-## Quantification Pipeline — Field Fraction
+## Multi-Study Configuration
 
-**Field fraction** = proportion of voxels above the segmentation threshold per region.
+Each Trident study has its own config file under `config/trident/`:
 
-### Computation
+```
+config/trident/
+├── ki3.yml               # KI3 study — ki3_15T heuristic, custom session labels
+├── lecanemab_early.yml   # Lecanemab early — 4 search specs, subject remapping
+├── lecanemab_late.yml    # Lecanemab late — null mapping to exclude subjects
+├── mouse_app_mapt_apoe.yml  # Mouse AD study — format strings for IDs
+└── vaccine.yml           # Vaccine study — premap + constant session
+```
 
-1. Binary segmentation mask (foreground = 1)
-2. Downsample by averaging → values range 0–1 per voxel
-3. Transform to template space using saved registration
+**All studies share a single download cache**, avoiding redundant downloads when the same scan appears in multiple studies.
 
-### Outputs
+```yaml
+# Per-study stage directories (all studies share one cache)
+stages:
+  query:    "results/vaccine/0_query"
+  filter:   "results/vaccine/1_filter"
+  download: "results/vaccine/2_download"
+  convert:  "results/vaccine/3_convert"
+  fix:      "results/vaccine/4_fix"
 
-| File | Description |
-|------|-------------|
-| `seg/*_fieldfrac.nii.gz` | Field fraction in native SPIM space |
-| `seg/*_space-{template}_fieldfrac.nii.gz` | Field fraction in template space |
-| `tabular/*_seg-{roi}_segstats.tsv` | Field fraction aggregated by atlas ROI |
-| `seg/*_seg-{roi}_fieldfrac.nii.gz` | Heatmap volumes per atlas parcellation |
-
----
-
-## Quantification Pipeline — Instance-Based Metrics
-
-For counting **individual objects** (plaques, cells) rather than continuous signal.
-
-### Method
-
-- Connected-component labeling run on **overlapping chunks** (chunk-based parallelism via Dask)
-- Objects touching chunk boundaries are handled via overlap regions
-- Only instances with **centroids inside the chunk** are retained → no double-counting
-
-### Available Metrics
-
-| Metric | Description |
-|--------|-------------|
-| `count` | Number of instances per atlas region |
-| `density` | Instances per unit regional volume |
-| `nvoxels` | Size distribution of instances |
-| `volume` | Total volume of instances per region |
+download_cache: "/nfs/trident3/mri/cfmm2bids/results/download_cache"
+```
 
 ---
 
-## Quantification Pipeline — Vessel Analysis
+## Running the Workflow
 
-Specialized pipeline for **vascular segmentation** (CD31, Lectin stains).
-
-### Method
-
-- **VesselFM** deep-learning model for vessel detection
-- **Signed distance transform** from vessel surfaces
-  - Used to relate plaques/cells with nearby vasculature (e.g., CAA analysis)
-
-### Outputs
-
-| File | Description |
-|------|-------------|
-| `vessels/*_fieldfrac.nii.gz` | Vessel field fraction (volume density) |
-| `vessels/*_density.nii.gz` | Vessel count density |
-
-> Next-generation vessel graph analysis is in active development.
-
----
-
-## Running the Pipeline — Basic Usage
+### Prerequisites
 
 ```bash
-# Install (one-time)
-curl -fsSL https://pixi.sh/install.sh | bash
-git clone https://github.com/khanlab/SPIMquant.git
-cd SPIMquant && pixi install
+git clone https://github.com/khanlab/cfmm2bids.git
+cd cfmm2bids
+pixi install
+```
 
-# Validate (dry run)
-pixi run spimquant /path/to/bids /path/to/output participant -np
+### Basic commands
 
-# Full participant-level analysis
-pixi run spimquant /path/to/bids /path/to/output participant --cores all
+```bash
+# Dry run — preview all steps without executing
+pixi run snakemake --configfile config/trident/vaccine.yml --dry-run
 
-# Group-level statistics
-pixi run spimquant /path/to/bids /path/to/output group \
-  --contrast-column treatment \
-  --contrast-values control drug \
+# Process first subject only (for testing)
+pixi run snakemake --configfile config/trident/vaccine.yml \
+  --config head=1 --cores all
+
+# Full workflow
+pixi run snakemake --configfile config/trident/vaccine.yml --cores all
+
+# Run a specific stage only
+pixi run snakemake convert --configfile config/trident/vaccine.yml --cores all
+
+# Force re-query (when new scans acquired)
+pixi run snakemake --configfile config/trident/vaccine.yml \
+  --config force_requery=true --cores all
+```
+
+---
+
+## Running on a SLURM Cluster
+
+```bash
+pixi run snakemake --configfile config/trident/vaccine.yml \
+  --executor slurm \
+  --jobs 10 \
   --cores all
 ```
 
----
+> Each download and conversion job runs as a separate SLURM job.
+> Query caching prevents multiple jobs from querying the DICOM server simultaneously.
 
-## Running the Pipeline — Key CLI Options
-
-### Processing Control
-
-```
---registration-level N     Downsampling level for registration (default: 5)
---segmentation-level N     Downsampling level for segmentation (default: 0)
---no-segmentation          Skip segmentation & quantification
---no-vessels               Skip vessel analysis
---sloppy                   Low-quality params for quick testing
-```
-
-### Template & Atlas
+### Useful debug options
 
 ```
---template {ABAv3|DSURQE|gubra|MBMv3|turone}
---atlas-segs [SEGS ...]    Atlas parcellations to use
-```
-
-### Subject Selection
-
-```
---participant-label 01 02 03
-```
-
----
-
-## Running the Pipeline — Cluster & Cloud
-
-### SLURM Cluster
-
-```bash
-pixi run spimquant /bids /out participant \
-  --jobs 50 \
-  --executor slurm
-  --default-resources
-```
-
-
-
-### Useful Debug Options
-
-```
--n / --dry-run         Show what would run without executing
+--dry-run / -n         Preview without executing
 -R rule_name           Re-run a specific rule
---until rule_name      Run only up to a specific rule
---report               Generate an HTML workflow report
+--until rule_name      Run only up to (and including) a rule
+--report               Generate an HTML Snakemake workflow report
 --notemp               Keep all intermediate files
+--rerun-incomplete     Re-run any incomplete jobs from a previous run
 ```
 
 ---
 
-## Demo — Subject-Level Outputs
-
-### What to look at for a single subject
-
-1. **Registration QC report** — `xfm/*_regqc.html`
-   - Check alignment of SPIM to template brain
-   - Look for gross misregistration or mask failures
-
-2. **Field fraction heatmap** — `seg/*_seg-roi22_fieldfrac.nii.gz`
-   - Colour-coded plaque density per brain region in template space
-
-3. **TSV stats table** — `tabular/*_seg-roi22_segstats.tsv`
-   - Per-region numbers ready for downstream analysis
-
----
-
-## Demo — Batch / Group Analysis
-
-### After processing a cohort
+## Output Directory Structure
 
 ```
-output/
-└── group/
-    ├── *_groupstats.tsv         # t-stat, p-value, Cohen's d per region
-    ├── *_groupstats.png         # Heatmap visualization
-    ├── *_groupstats.nii         # 3-D volumetric statistical maps
-    ├── *_groupavgsegstats.tsv   # Group-averaged stats per region
-    └── *_groupavg.{tstat|pval|cohensd}.nii.gz
+bids/                          ← Final validated BIDS dataset
+├── dataset_description.json
+├── participants.tsv
+└── sub-AS177M2/
+    └── ses-12m/
+        └── anat/
+            ├── sub-AS177M2_ses-12m_T2w.nii.gz
+            └── sub-AS177M2_ses-12m_T2w.json
+
+results/vaccine/
+├── 0_query/studies.tsv        ← All matched DICOM studies
+├── 1_filter/studies_filtered.tsv
+├── 2_download/dicoms/         ← Symlinks to cached tar files
+├── 3_convert/
+│   ├── bids-staging/          ← Per-session BIDS data
+│   └── qc/sub-*/ses-*/        ← series.svg, unmapped.svg
+└── 4_fix/
+    ├── bids-staging/          ← Fixed per-session BIDS data
+    └── qc/aggregate_report.html
 ```
-
-### Typical workflow
-
-1. Run participant level for all subjects
-2. Run group level with `--contrast-column` / `--contrast-values`
-3. Explore region-level TSV files in Python / R
-4. Visualise volumetric stat maps in ITK-SNAP or FSLeyes
 
 ---
 
 ## Summary
 
-| Stage | Tool | Key Output |
-|-------|------|-----------|
-| Raw → BIDS | SPIMprep | `sub-*/micr/*_SPIM.ome.zarr` |
-| Masking | SPIMquant | Brain mask |
-| Registration | SPIMquant | Transforms + QC report |
-| Segmentation | SPIMquant | Binary mask, field fraction |
-| Quantification | SPIMquant | TSVs, heatmap NIfTIs |
-| Vessel analysis | SPIMquant | Vessel density maps |
-| Group stats | SPIMquant | t-stat / p-val / Cohen's d maps |
+| Stage | Config key | Output |
+|-------|-----------|--------|
+| Query | `search_specs` | `studies.tsv` |
+| Filter | `study_filter_specs` | `studies_filtered.tsv` |
+| Download | `cfmm2tar_download_options` | `dicoms/sub-*/ses-*/` |
+| Convert | `heuristic`, `heudiconv_options` | `bids-staging/`, QC reports |
+| Fix | `post_convert_fixes` | `bids/` (validated) |
 
-**SPIMquant turns terabyte-scale whole-brain microscopy into publication-ready quantitative results.**
+**One config file per study → fully reproducible, automated BIDS conversion.**
+
+Key features:
+- 🔁 **Query caching** — skip re-query when nothing has changed
+- 💾 **Shared download cache** — avoid re-downloading across studies
+- 🗺️ **Flexible ID mapping** — regex, sanitize, premap, constant, format
+- 📅 **Session remapping by date** — automatic longitudinal session labels
+- 🔍 **QC reports** — per-session series tables + aggregate HTML report
 
 ---
 
@@ -393,64 +462,69 @@ output/
 
 ## Questions?
 
-📖 Documentation: https://spimquant.readthedocs.io/en/latest/
-💻 GitHub: https://github.com/khanlab/SPIMquant
+💻 GitHub: https://github.com/khanlab/cfmm2bids
 📧 Contact: Ali Khan — alik@robarts.ca
 
 ---
 
-## Appendix — Stain Support
+## Appendix — Metadata Mapping Options
 
-| Stain | Target | Pipeline |
-|-------|--------|----------|
-| PI / YOPRO / AutoF | Nuclear / autofluorescence | Registration channel |
-| Abeta / BetaAmyloid | Beta-amyloid plaques (AD) | Segmentation |
-| AlphaSynuclein | Lewy bodies (PD) | Segmentation |
-| Iba1 | Microglia | Segmentation |
-| ChAT | Cholinergic neurons | Segmentation |
-| CD31 / Lectin | Blood vessels | Vessel pipeline |
-
----
-
-## Appendix — Output Directory Structure
-
-```
-output/
-├── sub-{id}/
-│   ├── micr/        # Registered SPIM images (NIfTI + OME-Zarr)
-│   ├── xfm/         # Transforms + registration QC reports
-│   ├── seg/         # Segmentation masks + field fraction maps
-│   ├── parc/        # Atlas parcellations in native space
-│   ├── vessels/     # Vessel density maps
-│   ├── tabular/     # Per-region statistics (TSV)
-│   └── anat/        # MRI (if --register-to-mri used)
-└── group/
-    ├── *_groupstats.tsv
-    ├── *_groupstats.png
-    └── *_groupavg.*.nii.gz
-```
+| Option | Description | Example |
+|--------|-------------|---------|
+| `source` | DICOM field to extract from | `PatientName`, `StudyDate` |
+| `pattern` | Regex with capture group | `'(AS[a-z0-9A-Z]+)$'` |
+| `sanitize` | Remove non-alphanumeric chars | `true` |
+| `premap` | Rename raw DICOM values before extraction | `177M2: AS177M2` |
+| `map` | Rename extracted values | `'64-5F2': AS303F2` |
+| `constant` | Fixed value for all subjects/sessions | `'15T'` |
+| `format` | Reformat extracted value with a template | `"AA{value}"` |
+| `fillna` | Default when extraction returns empty | `'01'` |
 
 ---
 
-## Appendix — Installation Details
+## Appendix — Session Remapping by Date
 
+Converts raw `StudyDate` values to interpretable longitudinal labels.
+
+```yaml
+remap_sessions_by_date:
+  enable: true
+  units: 'months'    # days, months, or years
+  round_step: 3      # Round to nearest 3 months
+  time_to_label:     # Custom label mapping
+    0: '06m'
+    3: '09m'
+    6: '12m'
+```
+
+**How it works:**
+1. For each subject, the earliest study date is treated as the baseline
+2. Time since baseline is computed and rounded to the nearest `round_step`
+3. Labels from `time_to_label` are applied (or auto-generated as `0m`, `3m`, etc.)
+
+Optional: use `reference_col: PatientBirthDate` to compute age at scan instead.
+
+---
+
+## Appendix — Gradcorrect Stage (optional)
+
+Applies gradient nonlinearity correction using the [gradcorrect BIDS app](https://github.com/khanlab/gradcorrect).
+
+```yaml
+gradcorrect:
+  enable: true
+  grad_coeff_file: "path/to/gradient_coeff.grad"
+  create_bids_uncorr: true   # Also keep the uncorrected dataset
+```
+
+Run with:
 ```bash
-# 1. Install Pixi
-curl -fsSL https://pixi.sh/install.sh | bash
-
-# 2. Clone SPIMquant
-git clone https://github.com/khanlab/SPIMquant.git
-cd SPIMquant
-
-# 3. Install all dependencies (creates isolated environment)
-pixi install
-
-# 4. Verify
-pixi run spimquant --help
+pixi run snakemake --configfile config/myconfig.yml \
+  --use-singularity --cores all
 ```
 
-**System requirements:**
-- Linux x86-64
-- ≥32 GB RAM (64+ GB recommended for large datasets)
-- SSD storage for optimal I/O performance
-- No GPU required (CPU-only pipeline)
+**Outputs:**
+- `bids/` — Gradient-corrected BIDS dataset
+- `bids_uncorr/` — Uncorrected dataset (when `create_bids_uncorr: true`)
+
+> The corrected dataset has been resampled; keep the uncorrected version for analyses sensitive to resampling.

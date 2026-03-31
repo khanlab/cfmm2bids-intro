@@ -1,9 +1,9 @@
-# SPIMquant-intro
-Introduction and tutorial for SPIMquant
+# cfmm2bids-intro
+Introduction and overview of the cfmm2bids workflow for reproducible and automated BIDS conversion.
 
 ## Contents
 
-- [`presentation.md`](presentation.md) — Marp-based slide deck covering the SPIMquant intro tutorial and demo.
+- [`presentation.md`](presentation.md) — Marp-based slide deck covering the cfmm2bids workflow, using the Trident studies (`config/trident`) as examples.
 - [`draft_tutorial.md`](draft_tutorial.md) — Outline / notes used to build the presentation.
 
 ## Viewing the Presentation
@@ -32,5 +32,4 @@ Install the [Marp for VS Code](https://marketplace.visualstudio.com/items?itemNa
 
 ## Links
 
-- 🔗 SPIMquant GitHub: <https://github.com/khanlab/SPIMquant>
-- 📖 SPIMquant Docs: <https://spimquant.readthedocs.io>
+- 🔗 cfmm2bids GitHub: <https://github.com/khanlab/cfmm2bids>
